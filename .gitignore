@@ -13,9 +13,10 @@ storage/
 VibeVoice/
 
 # Python dependencies
-requirements.txt
-backend/requirements.txt
-tts_worker/requirements.txt
+!requirements.txt
+!backend/requirements.txt
+!tts_worker/requirements.txt
+
 
 # Local sqlite DBs created during development
 backend/data/
