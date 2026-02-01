@@ -1,0 +1,30 @@
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b1020; color: #e8ebff; }
+.container { max-width: 1260px; margin: 0 auto; padding: 24px; }
+.appShell { display: flex; gap: 16px; align-items: flex-start; }
+.sidebar { width: 300px; flex: 0 0 300px; position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; }
+.main { flex: 1; min-width: 0; }
+.card { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 16px; margin: 12px 0; }
+.sidebar .card { margin-top: 0; }
+.main > .card:first-child { margin-top: 0; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+label { display: block; font-size: 12px; opacity: 0.85; margin-bottom: 6px; }
+input, textarea { width: 100%; box-sizing: border-box; border-radius: 10px; border: 1px solid rgba(255,255,255,0.18); background: rgba(0,0,0,0.25); color: #e8ebff; padding: 10px; }
+textarea { min-height: 260px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+button { border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.10); color: #e8ebff; padding: 10px 12px; border-radius: 10px; cursor: pointer; }
+button.primary { background: #4c6fff; border-color: #4c6fff; }
+button.danger { background: rgba(255,80,80,0.16); border-color: rgba(255,80,80,0.55); color: #ffd1d1; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.small { font-size: 12px; opacity: 0.85; }
+.error { color: #ffb4b4; }
+.success { color: #b6ffd2; }
+
+.historyItem { border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.22); padding: 10px; border-radius: 12px; cursor: pointer; user-select: none; }
+.historyItem:hover { border-color: rgba(255,255,255,0.22); background: rgba(0,0,0,0.30); }
+.historyItem.active { border-color: rgba(76,111,255,0.70); background: rgba(76,111,255,0.18); }
+.historyRow { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.historyTitle { font-size: 13px; font-weight: 600; opacity: 0.95; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 980px) {
+	.appShell { flex-direction: column; }
+	.sidebar { width: auto; position: static; max-height: none; }
+}

@@ -1,0 +1,17 @@
+.venv/
+.env
+node_modules
+dist
+build
+.DS_Store
+*.log
+*.pyc
+__pycache__/
+*.txt
+*.wav
+storage/
+VibeVoice/
+
+# Local sqlite DBs created during development
+backend/data/
+tts_worker/data/
