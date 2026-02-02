@@ -296,7 +296,7 @@ def generate_podcast_script(
             log.step("generation", "Web search disabled")
     user = (
         f"主题：{theme}\n\n"
-        f"请生成一段约 {minutes} 分钟的 {speaker_count} 人中文播客对话脚本。\n"
+        f"请生成一段约 {minutes} 分钟的 {speaker_count} 人播客对话脚本, 按指定的语言，默认英文。\n"
         "严格使用以下格式逐行输出（只能使用 Speaker + 数字，不要写人名）：\n"
         f"{speaker_format}\n"
         "要求：\n"

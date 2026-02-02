@@ -1,0 +1,17 @@
+name: podcaststudio
+
+infra:
+  path: infra
+
+services:
+  web:
+    project: .
+    language: docker
+    host: containerapp
+    resourceName: ${BACKEND_APP_NAME}
+
+  tts-worker:
+    project: ./tts_worker
+    language: docker
+    host: containerapp
+    resourceName: ${TTS_WORKER_APP_NAME}

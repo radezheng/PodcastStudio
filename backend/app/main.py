@@ -9,20 +9,29 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .azure_openai import DEFAULT_PODCAST_SYSTEM_PROMPT, generate_podcast_script
-from .db import Db, init_db
 from .env import load_project_env
+from .file_store import BackendFileStore
 from .script_logs import ScriptLogWriter, group_events_by_stage, read_script_log_events
 
 
 load_project_env()
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # PodcastStudio/
+
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "VibeVoice").is_dir():
+            return parent
+    return here.parents[2]
+
+
+PROJECT_ROOT = _find_project_root()
 
 
 def _storage_root() -> Path:
@@ -37,7 +46,19 @@ def _storage_root() -> Path:
 
 STORAGE_ROOT = _storage_root()
 CONFIG_DIR = STORAGE_ROOT / "config"
-DB_DIR = STORAGE_ROOT / "db" / "backend"
+
+
+def _db_dir(default: Path, *, env_var: str) -> Path:
+    raw = os.environ.get(env_var, "").strip().strip('"')
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (PROJECT_ROOT / p).resolve()
+        return p
+    return default
+
+
+DB_DIR = _db_dir(STORAGE_ROOT / "db" / "backend", env_var="PODCASTSTUDIO_DB_DIR_BACKEND")
 LOG_DIR = STORAGE_ROOT / "logs" / "backend" / "scripts"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,8 +68,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 SYSTEM_PROMPT_PATH = CONFIG_DIR / "system_prompt.txt"
 SPEAKERS_PATH = CONFIG_DIR / "speakers.json"
 
-DB = Db(path=str(DB_DIR / "app.db"))
-init_db(DB)
+STORE = BackendFileStore(root=DB_DIR)
 
 TTS_WORKER_URL = os.environ.get("TTS_WORKER_URL", "http://localhost:8002").strip().strip('"')
 
@@ -61,6 +81,13 @@ app.add_middleware(
     allow_methods=["*"] ,
     allow_headers=["*"] ,
 )
+
+
+@app.get("/config.js", include_in_schema=False)
+def get_runtime_config_js() -> Response:
+    api_base = os.environ.get("PODCASTSTUDIO_API_BASE", "").strip().strip('"')
+    body = "window.__PODCASTSTUDIO_CONFIG__ = " + json.dumps({"apiBase": api_base}) + ";\n"
+    return Response(content=body, media_type="application/javascript")
 
 
 class GenerateScriptRequest(BaseModel):
@@ -179,45 +206,42 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-@dataclass(frozen=True)
-class _MetaRow:
-    minutes: int
-    speaker_names: list[str]
-    system_prompt: str | None
-    use_web_search: bool
-    source_filename: str | None
-    source_url: str | None
-
-
-def _read_script_meta(script_id: str) -> _MetaRow | None:
-    with DB.connect() as conn:
-        row = conn.execute(
-            "SELECT minutes, speaker_names_json, system_prompt, use_web_search, source_filename, source_url FROM script_meta WHERE script_id = ?",
-            (script_id,),
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        speaker_names = json.loads(row["speaker_names_json"] or "[]")
-        if not isinstance(speaker_names, list):
-            speaker_names = []
-        speaker_names = [str(x) for x in speaker_names if str(x).strip()]
-    except Exception:
-        speaker_names = []
-
-    return _MetaRow(
-        minutes=int(row["minutes"]),
-        speaker_names=speaker_names,
-        system_prompt=(row["system_prompt"] if row["system_prompt"] is not None else None),
-        use_web_search=bool(row["use_web_search"]),
-        source_filename=(row["source_filename"] if row["source_filename"] is not None else None),
-        source_url=(row["source_url"] if row["source_url"] is not None else None),
-    )
+def _coerce_speaker_list(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        try:
+            v = json.loads(value)
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+        except Exception:
+            pass
+        return [s.strip() for s in value.split() if s.strip()]
+    return []
 
 
 @app.get("/health")
 def health():
     return {"ok": True, "tts_worker_url": TTS_WORKER_URL}
+
+
+def _poke_tts_worker() -> None:
+    # Best-effort: this call exists mainly to trigger scale-from-zero.
+    try:
+        timeout = httpx.Timeout(connect=5.0, read=60.0, write=60.0, pool=5.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            client.get(f"{TTS_WORKER_URL}/health")
+    except Exception:
+        # Intentionally ignore errors; this should never break the UI.
+        return
+
+
+@app.post("/api/tts-worker/activate")
+def activate_tts_worker(bg: BackgroundTasks):
+    bg.add_task(_poke_tts_worker)
+    return {"scheduled": True}
 
 
 @app.get("/api/config", response_model=AppConfigResponse)
@@ -289,9 +313,7 @@ def generate_script(req: GenerateScriptRequest):
         raise HTTPException(status_code=400, detail="script_id must be a valid UUID")
 
     # Prevent collisions if client retries with the same id.
-    with DB.connect() as conn:
-        existing = conn.execute("SELECT id FROM scripts WHERE id = ?", (script_id,)).fetchone()
-    if existing is not None:
+    if STORE.get_script(script_id) is not None:
         raise HTTPException(status_code=409, detail="script_id already exists")
 
     log = ScriptLogWriter(file_path=(LOG_DIR / f"{script_id}.jsonl"), script_id=script_id)
@@ -390,71 +412,73 @@ def generate_script(req: GenerateScriptRequest):
         log.stage_end("generation", "failed")
         raise
 
-    with DB.connect() as conn:
-        log.stage_start("db", "Persist script")
-        conn.execute(
-            "INSERT INTO scripts (id, theme, content, confirmed, created_at) VALUES (?, ?, ?, 0, ?)",
-            (script_id, req.theme, content, _utc_now()),
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO script_meta
-                (script_id, minutes, speaker_names_json, system_prompt, use_web_search, source_filename, source_url, created_at)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                script_id,
-                int(req.minutes),
-                json.dumps(selected, ensure_ascii=False),
-                (req.system_prompt if req.system_prompt is not None else None),
-                (1 if req.use_web_search else 0),
-                (source_filename if source_filename else None),
-                (source_url if source_url else None),
-                _utc_now(),
-            ),
-        )
-        conn.commit()
-        log.stage_end("db", "ok")
+    log.stage_start("db", "Persist script")
+    now = _utc_now()
+    STORE.put_script(
+        {
+            "script_id": script_id,
+            "theme": theme,
+            "content": content,
+            "confirmed": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    STORE.put_meta(
+        script_id,
+        {
+            "minutes": int(req.minutes),
+            "speaker_names": selected,
+            "system_prompt": (req.system_prompt if req.system_prompt is not None else None),
+            "use_web_search": bool(req.use_web_search),
+            "source_filename": (source_filename if source_filename else None),
+            "source_url": (source_url if source_url else None),
+            "created_at": now,
+        },
+    )
+    log.stage_end("db", "ok")
 
-    return ScriptResponse(script_id=script_id, theme=req.theme, content=content, confirmed=False)
+    return ScriptResponse(script_id=script_id, theme=theme, content=content, confirmed=False)
 
 
 @app.get("/api/scripts", response_model=ScriptListResponse)
 def list_scripts(limit: int = 50):
     limit = max(1, min(int(limit), 200))
-    with DB.connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                s.id AS script_id,
-                s.theme,
-                s.confirmed,
-                s.created_at,
-                (
-                    SELECT COUNT(*) FROM tts_jobs j WHERE j.script_id = s.id
-                ) AS job_count,
-                (
-                    SELECT j2.status FROM tts_jobs j2 WHERE j2.script_id = s.id ORDER BY j2.created_at DESC LIMIT 1
-                ) AS last_job_status
-            FROM scripts s
-            ORDER BY s.created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+    scripts_raw = STORE.list_scripts()
+    jobs_raw = STORE.list_jobs()
 
-    scripts = [
-        ScriptListItem(
-            script_id=r["script_id"],
-            theme=r["theme"],
-            confirmed=bool(r["confirmed"]),
-            created_at=r["created_at"],
-            job_count=int(r["job_count"] or 0),
-            last_job_status=(r["last_job_status"] if r["last_job_status"] is not None else None),
+    # Group job stats by script_id for list view.
+    by_script: dict[str, list[dict]] = {}
+    for j in jobs_raw:
+        sid = str(j.get("script_id") or "")
+        if not sid:
+            continue
+        by_script.setdefault(sid, []).append(j)
+
+    def _created_at(item: dict) -> str:
+        return str(item.get("created_at") or "")
+
+    scripts_raw.sort(key=_created_at, reverse=True)
+    scripts_raw = scripts_raw[:limit]
+
+    scripts: list[ScriptListItem] = []
+    for s in scripts_raw:
+        sid = str(s.get("script_id") or "")
+        jobs = by_script.get(sid, [])
+        jobs_sorted = sorted(jobs, key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        last_status = None
+        if jobs_sorted:
+            last_status = jobs_sorted[0].get("status")
+        scripts.append(
+            ScriptListItem(
+                script_id=sid,
+                theme=str(s.get("theme") or ""),
+                confirmed=bool(s.get("confirmed")),
+                created_at=str(s.get("created_at") or ""),
+                job_count=len(jobs),
+                last_job_status=(str(last_status) if last_status is not None else None),
+            )
         )
-        for r in rows
-    ]
     return ScriptListResponse(scripts=scripts)
 
 
@@ -467,87 +491,82 @@ def get_script_logs(script_id: str):
 
 @app.get("/api/scripts/{script_id}", response_model=ScriptResponse)
 def get_script(script_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
+    row = STORE.get_script(script_id)
     if row is None:
         raise HTTPException(status_code=404, detail="script not found")
     return ScriptResponse(
-        script_id=row["id"],
-        theme=row["theme"],
-        content=row["content"],
-        confirmed=bool(row["confirmed"]),
+        script_id=str(row.get("script_id")),
+        theme=str(row.get("theme") or ""),
+        content=str(row.get("content") or ""),
+        confirmed=bool(row.get("confirmed")),
     )
 
 
 @app.get("/api/scripts/{script_id}/full", response_model=ScriptFullResponse)
 def get_script_full(script_id: str):
     worker_payload_by_job_id: dict[str, dict] = {}
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="script not found")
-        jobs = conn.execute(
-            "SELECT * FROM tts_jobs WHERE script_id = ? ORDER BY created_at DESC",
-            (script_id,),
-        ).fetchall()
+    row = STORE.get_script(script_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="script not found")
 
-        # Best-effort status sync for all jobs on this script.
-        changed = False
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                for j in jobs:
-                    worker_job_id = j["worker_job_id"]
-                    try:
-                        r = client.get(f"{TTS_WORKER_URL}/jobs/{worker_job_id}")
-                        r.raise_for_status()
-                        payload = r.json() or {}
-                        worker_payload_by_job_id[j["id"]] = payload
-                        ws = payload.get("status")
-                        if ws in {"queued", "running", "completed", "failed"} and ws != j["status"]:
-                            conn.execute(
-                                "UPDATE tts_jobs SET status = ?, updated_at = ? WHERE id = ?",
-                                (ws, _utc_now(), j["id"]),
-                            )
-                            changed = True
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+    jobs = [j for j in STORE.list_jobs() if str(j.get("script_id") or "") == script_id]
+    jobs.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
 
-        if changed:
-            conn.commit()
+    # Best-effort status sync for all jobs on this script.
+    changed = False
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            for j in jobs:
+                worker_job_id = str(j.get("worker_job_id") or "")
+                if not worker_job_id:
+                    continue
+                try:
+                    r = client.get(f"{TTS_WORKER_URL}/jobs/{worker_job_id}")
+                    r.raise_for_status()
+                    payload = r.json() or {}
+                    worker_payload_by_job_id[str(j.get("job_id"))] = payload
+                    ws = payload.get("status")
+                    if ws in {"queued", "running", "completed", "failed"} and ws != j.get("status"):
+                        j["status"] = ws
+                        j["updated_at"] = _utc_now()
+                        STORE.put_job(j)
+                        changed = True
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
-    meta = _read_script_meta(script_id)
+    meta = STORE.get_meta(script_id)
     meta_resp = None
     if meta is not None:
         meta_resp = ScriptMetaResponse(
-            minutes=meta.minutes,
-            speaker_names=meta.speaker_names,
-            system_prompt=meta.system_prompt,
-            use_web_search=meta.use_web_search,
-            source_filename=meta.source_filename,
-            source_url=meta.source_url,
+            minutes=int(meta.get("minutes") or 4),
+            speaker_names=_coerce_speaker_list(meta.get("speaker_names")),
+            system_prompt=(meta.get("system_prompt") if meta.get("system_prompt") is not None else None),
+            use_web_search=bool(meta.get("use_web_search")),
+            source_filename=(meta.get("source_filename") if meta.get("source_filename") is not None else None),
+            source_url=(meta.get("source_url") if meta.get("source_url") is not None else None),
         )
 
     return ScriptFullResponse(
         script=ScriptDetailResponse(
-            script_id=row["id"],
-            theme=row["theme"],
-            content=row["content"],
-            confirmed=bool(row["confirmed"]),
-            created_at=row["created_at"],
+            script_id=str(row.get("script_id")),
+            theme=str(row.get("theme") or ""),
+            content=str(row.get("content") or ""),
+            confirmed=bool(row.get("confirmed")),
+            created_at=str(row.get("created_at") or ""),
         ),
         meta=meta_resp,
         tts_jobs=[
             ScriptJobItem(
-                job_id=j["id"],
-                worker_job_id=j["worker_job_id"],
-                status=j["status"],
-                worker_status=(worker_payload_by_job_id.get(j["id"], {}) or {}).get("status"),
-                output_filename=(worker_payload_by_job_id.get(j["id"], {}) or {}).get("output_filename"),
-                error=(worker_payload_by_job_id.get(j["id"], {}) or {}).get("error"),
-                created_at=j["created_at"],
-                updated_at=j["updated_at"],
+                job_id=str(j.get("job_id")),
+                worker_job_id=str(j.get("worker_job_id") or ""),
+                status=str(j.get("status") or "queued"),
+                worker_status=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("status"),
+                output_filename=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("output_filename"),
+                error=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("error"),
+                created_at=str(j.get("created_at") or ""),
+                updated_at=str(j.get("updated_at") or ""),
             )
             for j in jobs
         ],
@@ -556,14 +575,11 @@ def get_script_full(script_id: str):
 
 @app.delete("/api/scripts/{script_id}")
 def delete_script(script_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT id FROM scripts WHERE id = ?", (script_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="script not found")
-        conn.execute("DELETE FROM tts_jobs WHERE script_id = ?", (script_id,))
-        conn.execute("DELETE FROM script_meta WHERE script_id = ?", (script_id,))
-        conn.execute("DELETE FROM scripts WHERE id = ?", (script_id,))
-        conn.commit()
+    row = STORE.get_script(script_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="script not found")
+    STORE.delete_jobs_for_script(script_id)
+    STORE.delete_script(script_id)
 
     # Best-effort delete backend logs
     try:
@@ -578,46 +594,42 @@ def delete_script(script_id: str):
 
 @app.put("/api/scripts/{script_id}", response_model=ScriptResponse)
 def update_script(script_id: str, req: UpdateScriptRequest):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="script not found")
-        conn.execute(
-            "UPDATE scripts SET content = ? WHERE id = ?",
-            (req.content, script_id),
-        )
-        conn.commit()
+    row = STORE.get_script(script_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="script not found")
+    row["content"] = req.content
+    row["updated_at"] = _utc_now()
+    STORE.put_script(row)
 
-        row2 = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
+    row2 = STORE.get_script(script_id)
 
     return ScriptResponse(
-        script_id=row2["id"],
-        theme=row2["theme"],
-        content=row2["content"],
-        confirmed=bool(row2["confirmed"]),
+        script_id=str(row2.get("script_id")),
+        theme=str(row2.get("theme") or ""),
+        content=str(row2.get("content") or ""),
+        confirmed=bool(row2.get("confirmed")),
     )
 
 
 @app.post("/api/scripts/{script_id}/confirm", response_model=ConfirmResponse)
 def confirm_script(script_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="script not found")
-        conn.execute("UPDATE scripts SET confirmed = 1 WHERE id = ?", (script_id,))
-        conn.commit()
+    row = STORE.get_script(script_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="script not found")
+    row["confirmed"] = True
+    row["updated_at"] = _utc_now()
+    STORE.put_script(row)
     return ConfirmResponse(script_id=script_id, confirmed=True)
 
 
 @app.post("/api/scripts/{script_id}/tts", response_model=SubmitTTSResponse)
 def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="script not found")
-        if not bool(row["confirmed"]):
-            raise HTTPException(status_code=400, detail="script must be confirmed before TTS")
-        content = row["content"]
+    row = STORE.get_script(script_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="script not found")
+    if not bool(row.get("confirmed")):
+        raise HTTPException(status_code=400, detail="script must be confirmed before TTS")
+    content = str(row.get("content") or "")
 
     job_id = str(uuid.uuid4())
 
@@ -630,7 +642,8 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
         log = None
 
     try:
-        with httpx.Client(timeout=10.0) as client:
+        timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             r = client.post(
                 f"{TTS_WORKER_URL}/jobs",
                 json={
@@ -660,12 +673,17 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
         except Exception:
             pass
 
-    with DB.connect() as conn:
-        conn.execute(
-            "INSERT INTO tts_jobs (id, script_id, worker_job_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, script_id, worker_job_id, status, _utc_now(), _utc_now()),
-        )
-        conn.commit()
+    now = _utc_now()
+    STORE.put_job(
+        {
+            "job_id": job_id,
+            "script_id": script_id,
+            "worker_job_id": worker_job_id,
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
 
     return SubmitTTSResponse(
         script_id=script_id,
@@ -677,8 +695,7 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatus)
 def get_job(job_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM tts_jobs WHERE id = ?", (job_id,)).fetchone()
+    row = STORE.get_job(job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
 
@@ -686,8 +703,9 @@ def get_job(job_id: str):
     output_filename = None
     error = None
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(f"{TTS_WORKER_URL}/jobs/{row['worker_job_id']}")
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            r = client.get(f"{TTS_WORKER_URL}/jobs/{str(row.get('worker_job_id') or '')}")
             r.raise_for_status()
             payload = r.json()
             worker_status = payload.get("status")
@@ -697,18 +715,15 @@ def get_job(job_id: str):
         worker_status = None
 
     # Best-effort local status sync.
-    if worker_status in {"queued", "running", "completed", "failed"} and worker_status != row["status"]:
-        with DB.connect() as conn:
-            conn.execute(
-                "UPDATE tts_jobs SET status = ?, updated_at = ? WHERE id = ?",
-                (worker_status, _utc_now(), job_id),
-            )
-            conn.commit()
+    if worker_status in {"queued", "running", "completed", "failed"} and worker_status != row.get("status"):
+        row["status"] = worker_status
+        row["updated_at"] = _utc_now()
+        STORE.put_job(row)
 
     return JobStatus(
-        job_id=row["id"],
-        script_id=row["script_id"],
-        worker_job_id=row["worker_job_id"],
+        job_id=str(row.get("job_id")),
+        script_id=str(row.get("script_id")),
+        worker_job_id=str(row.get("worker_job_id")),
         status=(worker_status or row["status"]),
         worker_status=worker_status,
         output_filename=output_filename,
@@ -718,15 +733,15 @@ def get_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/audio")
 def download_audio(job_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM tts_jobs WHERE id = ?", (job_id,)).fetchone()
+    row = STORE.get_job(job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
 
-    worker_job_id = row["worker_job_id"]
+    worker_job_id = str(row.get("worker_job_id") or "")
 
     try:
-        with httpx.Client(timeout=None) as client:
+        timeout = httpx.Timeout(connect=5.0, read=300.0, write=300.0, pool=5.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             r = client.get(f"{TTS_WORKER_URL}/jobs/{worker_job_id}/audio")
             r.raise_for_status()
             content_type = r.headers.get("content-type", "audio/wav")
@@ -740,3 +755,11 @@ def download_audio(job_id: str):
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# If this process is running in the combined web image, serve the built frontend.
+_STATIC_DIR = Path(os.environ.get("PODCASTSTUDIO_STATIC_DIR", "/app/static")).resolve()
+if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

@@ -1,4 +1,8 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001'
+const runtimeApiBase =
+  typeof window !== 'undefined' && window.__PODCASTSTUDIO_CONFIG__ && window.__PODCASTSTUDIO_CONFIG__.apiBase
+
+const defaultBase = import.meta.env.PROD ? '' : 'http://localhost:8001'
+const API_BASE = runtimeApiBase || import.meta.env.VITE_API_BASE || defaultBase
 
 async function req(path, options = {}) {
   const r = await fetch(`${API_BASE}${path}`, {
@@ -33,6 +37,15 @@ export async function generateScript({ theme, minutes }) {
 export async function getConfig() {
   const r = await req('/api/config')
   return await r.json()
+}
+
+export async function activateTtsWorker() {
+  // Fire-and-forget. This triggers the internal worker to scale from 0.
+  try {
+    await req('/api/tts-worker/activate', { method: 'POST', body: JSON.stringify({}) })
+  } catch {
+    // non-fatal
+  }
 }
 
 export async function saveSystemPrompt(system_prompt) {

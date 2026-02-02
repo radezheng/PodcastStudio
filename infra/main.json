@@ -1,0 +1,361 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.40.2.10011",
+      "templateHash": "9855392856259806817"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources"
+      }
+    },
+    "nameToken": {
+      "type": "string",
+      "defaultValue": "[toLower(uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "A short token to make resource names unique"
+      }
+    },
+    "acaEnvName": {
+      "type": "string",
+      "defaultValue": "[format('podcaststudio-{0}', parameters('nameToken'))]",
+      "metadata": {
+        "description": "Container Apps Environment name"
+      }
+    },
+    "backendAppName": {
+      "type": "string",
+      "defaultValue": "[format('podcast-web-{0}', parameters('nameToken'))]",
+      "metadata": {
+        "description": "Container App names"
+      }
+    },
+    "fileShareName": {
+      "type": "string",
+      "defaultValue": "podcaststudio",
+      "metadata": {
+        "description": "Azure Files share name"
+      }
+    },
+    "storageMountPath": {
+      "type": "string",
+      "defaultValue": "/mnt/storage",
+      "metadata": {
+        "description": "Mount path inside containers"
+      }
+    },
+    "gpuWorkloadProfileName": {
+      "type": "string",
+      "defaultValue": "gpu",
+      "metadata": {
+        "description": "Workload profile name for serverless GPU (T4)"
+      }
+    },
+    "gpuWorkloadProfileType": {
+      "type": "string",
+      "defaultValue": "Consumption-GPU-NC8as-T4",
+      "metadata": {
+        "description": "Workload profile type for serverless GPU (T4). Must be supported in the chosen region."
+      }
+    },
+    "AZURE_OPENAI_API_KEY": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Azure OpenAI API key"
+      }
+    },
+    "AZURE_OPENAI_ENDPOINT": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure OpenAI endpoint, like https://xxx.openai.azure.com"
+      }
+    },
+    "AZURE_OPENAI_DEPLOYMENT_NAME": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure OpenAI deployment name"
+      }
+    },
+    "AZURE_OPENAI_BASE_URL": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional explicit Azure OpenAI base URL. If empty, backend derives from AZURE_OPENAI_ENDPOINT (adds /openai/v1/)."
+      }
+    },
+    "VIBEVOICE_MODEL_ID": {
+      "type": "string",
+      "defaultValue": "vibevoice/VibeVoice-1.5B",
+      "metadata": {
+        "description": "VibeVoice model id"
+      }
+    },
+    "VIBEVOICE_SPEAKER_NAMES": {
+      "type": "string",
+      "defaultValue": "Xinran Anchen",
+      "metadata": {
+        "description": "VibeVoice speaker names comma-separated or quoted string"
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "Max replicas for all apps"
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 0,
+      "metadata": {
+        "description": "Min replicas for all apps (set 0 for scale-to-zero)"
+      }
+    },
+    "minReplicasWorker": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "Min replicas for the GPU worker (recommend 1 to avoid cold-start timeouts)"
+      }
+    },
+    "placeholderPythonImage": {
+      "type": "string",
+      "defaultValue": "python:3.12-slim"
+    }
+  },
+  "variables": {
+    "minReplicasUnified": "[max(parameters('minReplicas'), parameters('minReplicasWorker'))]",
+    "openAiSecretName": "azure-openai-api-key",
+    "openAiSecret": "[if(not(empty(parameters('AZURE_OPENAI_API_KEY'))), createArray(createObject('name', variables('openAiSecretName'), 'value', parameters('AZURE_OPENAI_API_KEY'))), createArray())]",
+    "openAiEnv": "[if(not(empty(parameters('AZURE_OPENAI_API_KEY'))), createArray(createObject('name', 'AZURE_OPENAI_API_KEY', 'secretRef', variables('openAiSecretName'))), createArray())]",
+    "volumeName": "storage",
+    "envStorageName": "podcaststorage-smb",
+    "commonMounts": [
+      {
+        "volumeName": "[variables('volumeName')]",
+        "mountPath": "[parameters('storageMountPath')]"
+      }
+    ],
+    "commonVolumes": [
+      {
+        "name": "[variables('volumeName')]",
+        "storageType": "AzureFile",
+        "storageName": "[variables('envStorageName')]"
+      }
+    ],
+    "commonEnv": [
+      {
+        "name": "PODCASTSTUDIO_STORAGE_DIR",
+        "value": "[parameters('storageMountPath')]"
+      },
+      {
+        "name": "HF_HOME",
+        "value": "[format('{0}/hf', parameters('storageMountPath'))]"
+      },
+      {
+        "name": "HUGGINGFACE_HUB_CACHE",
+        "value": "[format('{0}/hf/hub', parameters('storageMountPath'))]"
+      },
+      {
+        "name": "TRANSFORMERS_CACHE",
+        "value": "[format('{0}/hf/transformers', parameters('storageMountPath'))]"
+      }
+    ]
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[format('log-{0}', parameters('nameToken'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[format('stn{0}', parameters('nameToken'))]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "SecurityControl": "Ignore",
+        "ConstControl": "Ignore"
+      },
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "allowSharedKeyAccess": true,
+        "enableHttpsTrafficOnly": true,
+        "largeFileSharesState": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/fileServices",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/{1}', format('stn{0}', parameters('nameToken')), 'default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', format('stn{0}', parameters('nameToken')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/{1}/{2}', format('stn{0}', parameters('nameToken')), 'default', parameters('fileShareName'))]",
+      "properties": {
+        "shareQuota": 1024
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices', format('stn{0}', parameters('nameToken')), 'default')]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2025-10-02-preview",
+      "name": "[parameters('acaEnvName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('nameToken'))), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('nameToken'))), '2022-10-01').primarySharedKey]"
+          }
+        },
+        "workloadProfiles": [
+          {
+            "name": "Consumption",
+            "workloadProfileType": "Consumption"
+          },
+          {
+            "name": "[parameters('gpuWorkloadProfileName')]",
+            "workloadProfileType": "[parameters('gpuWorkloadProfileType')]"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('nameToken')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments/storages",
+      "apiVersion": "2025-10-02-preview",
+      "name": "[format('{0}/{1}', parameters('acaEnvName'), 'podcaststorage-smb')]",
+      "properties": {
+        "azureFile": {
+          "accessMode": "ReadWrite",
+          "accountName": "[format('stn{0}', parameters('nameToken'))]",
+          "shareName": "[parameters('fileShareName')]",
+          "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', format('stn{0}', parameters('nameToken'))), '2023-01-01').keys[0].value]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('acaEnvName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', format('stn{0}', parameters('nameToken')), 'default', parameters('fileShareName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', format('stn{0}', parameters('nameToken')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[format('acr{0}', parameters('nameToken'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Basic"
+      },
+      "properties": {
+        "adminUserEnabled": true
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2025-10-02-preview",
+      "name": "[parameters('backendAppName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('acaEnvName'))]",
+        "workloadProfileName": "[parameters('gpuWorkloadProfileName')]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8001,
+            "transport": "auto",
+            "allowInsecure": false
+          },
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', format('acr{0}', parameters('nameToken'))), '2023-07-01').loginServer]",
+              "username": "[listCredentials(resourceId('Microsoft.ContainerRegistry/registries', format('acr{0}', parameters('nameToken'))), '2023-07-01').username]",
+              "passwordSecretRef": "acr-pwd"
+            }
+          ],
+          "secrets": "[concat(createArray(createObject('name', 'acr-pwd', 'value', listCredentials(resourceId('Microsoft.ContainerRegistry/registries', format('acr{0}', parameters('nameToken'))), '2023-07-01').passwords[0].value)), variables('openAiSecret'))]"
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('placeholderPythonImage')]",
+              "resources": {
+                "cpu": 8,
+                "gpu": 1,
+                "memory": "56Gi"
+              },
+              "env": "[concat(variables('commonEnv'), variables('openAiEnv'), createArray(createObject('name', 'AZURE_OPENAI_ENDPOINT', 'value', parameters('AZURE_OPENAI_ENDPOINT')), createObject('name', 'AZURE_OPENAI_DEPLOYMENT_NAME', 'value', parameters('AZURE_OPENAI_DEPLOYMENT_NAME')), createObject('name', 'AZURE_OPENAI_BASE_URL', 'value', parameters('AZURE_OPENAI_BASE_URL')), createObject('name', 'TTS_WORKER_URL', 'value', 'http://127.0.0.1:8002'), createObject('name', 'PODCASTSTUDIO_DB_DIR_BACKEND', 'value', '/tmp/podcaststudio/db/backend'), createObject('name', 'PODCASTSTUDIO_DB_DIR_TTS_WORKER', 'value', '/tmp/podcaststudio/db/tts_worker'), createObject('name', 'VIBEVOICE_MODEL_ID', 'value', parameters('VIBEVOICE_MODEL_ID')), createObject('name', 'VIBEVOICE_SPEAKER_NAMES', 'value', parameters('VIBEVOICE_SPEAKER_NAMES')), createObject('name', 'VIBEVOICE_REPO_DIR', 'value', '/opt/VibeVoice'), createObject('name', 'VIBEVOICE_INPROCESS', 'value', '1'), createObject('name', 'VIBEVOICE_WARMUP', 'value', '1'), createObject('name', 'VIBEVOICE_ALLOW_SUBPROCESS_FALLBACK', 'value', '0')))]",
+              "volumeMounts": "[variables('commonMounts')]"
+            }
+          ],
+          "scale": {
+            "minReplicas": "[variables('minReplicasUnified')]",
+            "maxReplicas": "[parameters('maxReplicas')]"
+          },
+          "volumes": "[variables('commonVolumes')]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', format('acr{0}', parameters('nameToken')))]",
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('acaEnvName'))]",
+        "[resourceId('Microsoft.App/managedEnvironments/storages', parameters('acaEnvName'), 'podcaststorage-smb')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "BACKEND_URL": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', parameters('backendAppName')), '2025-10-02-preview').configuration.ingress.fqdn)]"
+    },
+    "BACKEND_APP_NAME": {
+      "type": "string",
+      "value": "[parameters('backendAppName')]"
+    },
+    "AZURE_CONTAINER_REGISTRY_NAME": {
+      "type": "string",
+      "value": "[format('acr{0}', parameters('nameToken'))]"
+    },
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', format('acr{0}', parameters('nameToken'))), '2023-07-01').loginServer]"
+    },
+    "STORAGE_ACCOUNT_NAME": {
+      "type": "string",
+      "value": "[format('stn{0}', parameters('nameToken'))]"
+    },
+    "FILE_SHARE_NAME": {
+      "type": "string",
+      "value": "[parameters('fileShareName')]"
+    }
+  }
+}

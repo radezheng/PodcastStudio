@@ -1,0 +1,16 @@
+.git
+.venv
+storage
+VibeVoice
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+*.wav
+*.log
+
+# Include only the small VibeVoice demo voice samples used to populate the UI speaker list.
+!VibeVoice/
+!VibeVoice/demo/
+!VibeVoice/demo/voices/
+!VibeVoice/demo/voices/*.wav

@@ -11,14 +11,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .db import Db, init_db
 from .env import load_project_env
+from .file_store import WorkerFileStore
+from .vibevoice_engine import start_background_warmup
 from .vibevoice_job import run_vibevoice_inference
 
 
 load_project_env()
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # PodcastStudio/
+
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "VibeVoice").is_dir():
+            return parent
+    return here.parents[2]
+
+
+PROJECT_ROOT = _find_project_root()
 
 
 def _storage_root() -> Path:
@@ -32,13 +42,30 @@ def _storage_root() -> Path:
 
 
 STORAGE_ROOT = _storage_root()
-DB_DIR = STORAGE_ROOT / "db" / "tts_worker"
+
+
+def _db_dir(default: Path, *, env_var: str) -> Path:
+    raw = os.environ.get(env_var, "").strip().strip('"')
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (PROJECT_ROOT / p).resolve()
+        return p
+    return default
+
+
+DB_DIR = _db_dir(STORAGE_ROOT / "db" / "tts_worker", env_var="PODCASTSTUDIO_DB_DIR_TTS_WORKER")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 
-DB = Db(path=str(DB_DIR / "worker.db"))
-init_db(DB)
+STORE = WorkerFileStore(root=DB_DIR)
 
 app = FastAPI(title="VibeVoice TTS Worker", version="0.1.0")
+
+
+@app.on_event("startup")
+def _startup_warmup() -> None:
+    # Start model download/loading early without blocking worker startup.
+    start_background_warmup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,32 +90,44 @@ def _process_job(
     script_text: str,
     speaker_names: list[str] | None,
 ) -> None:
-    with DB.connect() as conn:
-        conn.execute(
-            "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
-            ("running", _utc_now(), job_id),
-        )
-        conn.commit()
+    job = STORE.get_job(job_id) or {}
+    job.update({"status": "running", "updated_at": _utc_now()})
+    STORE.put_job(job)
 
     try:
+        job_dir = STORE.job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
         out_path = run_vibevoice_inference(
+            job_id=job_id,
             script_text=script_text,
             script_id=script_id,
             speaker_names=speaker_names,
+            output_dir=job_dir,
         )
-        with DB.connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, output_path = ?, error = NULL, updated_at = ? WHERE id = ?",
-                ("completed", str(out_path), _utc_now(), job_id),
-            )
-            conn.commit()
+
+        # Normalize to a stable filename for downloads.
+        audio_path = STORE.audio_path(job_id)
+        try:
+            if out_path != audio_path:
+                audio_path.write_bytes(Path(out_path).read_bytes())
+        except Exception:
+            # Fall back to whatever path we have.
+            audio_path = Path(out_path)
+
+        job = STORE.get_job(job_id) or {}
+        job.update(
+            {
+                "status": "completed",
+                "output_path": str(audio_path),
+                "error": None,
+                "updated_at": _utc_now(),
+            }
+        )
+        STORE.put_job(job)
     except Exception as e:
-        with DB.connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-                ("failed", str(e), _utc_now(), job_id),
-            )
-            conn.commit()
+        job = STORE.get_job(job_id) or {}
+        job.update({"status": "failed", "error": str(e), "updated_at": _utc_now()})
+        STORE.put_job(job)
 
 
 class SubmitJobRequest(BaseModel):
@@ -119,12 +158,16 @@ def health():
 def submit_job(req: SubmitJobRequest):
     job_id = str(uuid.uuid4())
 
-    with DB.connect() as conn:
-        conn.execute(
-            "INSERT INTO jobs (id, script_id, status, output_path, error, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?)",
-            (job_id, req.script_id, "queued", _utc_now(), _utc_now()),
-        )
-        conn.commit()
+    job = {
+        "job_id": job_id,
+        "script_id": req.script_id,
+        "status": "queued",
+        "output_path": None,
+        "error": None,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+    }
+    STORE.put_job(job)
 
     _EXECUTOR.submit(
         _process_job,
@@ -139,36 +182,32 @@ def submit_job(req: SubmitJobRequest):
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-
+    row = STORE.get_job(job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
 
     output_filename = None
-    if row["output_path"]:
-        output_filename = Path(row["output_path"]).name
+    if row.get("output_path"):
+        output_filename = Path(str(row.get("output_path"))).name
 
     return JobResponse(
-        job_id=row["id"],
-        script_id=row["script_id"],
-        status=row["status"],
+        job_id=str(row.get("job_id")),
+        script_id=(row.get("script_id") if row.get("script_id") is not None else None),
+        status=str(row.get("status") or "queued"),
         output_filename=output_filename,
-        error=row["error"],
+        error=(row.get("error") if row.get("error") is not None else None),
     )
 
 
 @app.get("/jobs/{job_id}/audio")
 def download_audio(job_id: str):
-    with DB.connect() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-
+    row = STORE.get_job(job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
-    if row["status"] != "completed" or not row["output_path"]:
+    if str(row.get("status")) != "completed" or not row.get("output_path"):
         raise HTTPException(status_code=400, detail="job not completed")
 
-    path = Path(row["output_path"])
+    path = Path(str(row.get("output_path")))
     if not path.exists():
         raise HTTPException(status_code=404, detail="audio file missing")
 

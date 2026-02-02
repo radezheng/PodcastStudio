@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import {
+  activateTtsWorker,
   audioUrl,
   confirmScript,
   deleteScript,
@@ -19,7 +20,7 @@ export default function App() {
   const [minutes, setMinutes] = useState(4)
 
   const [supportedSpeakers, setSupportedSpeakers] = useState([])
-  const [selectedSpeakers, setSelectedSpeakers] = useState([])
+  const [selectedSpeakers, setSelectedSpeakers] = useState(['Xinran', 'Anchen'])
   const [maxSpeakers, setMaxSpeakers] = useState(4)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [builtinSystemPrompt, setBuiltinSystemPrompt] = useState('')
@@ -61,6 +62,15 @@ export default function App() {
     return generating || jobActive
   }, [scriptId, generating, jobId, jobStatus])
 
+  const preferredDefaultSpeakers = ['Xinran', 'Anchen']
+  function pickDefaultSpeakers(list) {
+    const supported = Array.isArray(list) ? list.filter(Boolean) : []
+    const pickedPreferred = preferredDefaultSpeakers.filter((s) => supported.includes(s))
+    if (pickedPreferred.length) return pickedPreferred
+    if (supported.length) return supported.slice(0, 2)
+    return preferredDefaultSpeakers
+  }
+
   function newUuid() {
     try {
       if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
@@ -100,6 +110,9 @@ export default function App() {
   useEffect(() => {
     let alive = true
     const boot = async () => {
+      // Non-blocking: poke worker early so it can scale-from-zero while UI loads.
+      activateTtsWorker()
+
       try {
         const cfg = await getConfig()
         if (!alive) return
@@ -107,9 +120,7 @@ export default function App() {
         setMaxSpeakers(cfg.max_speakers || 4)
         setSystemPrompt(cfg.default_system_prompt || '')
         setBuiltinSystemPrompt(cfg.builtin_system_prompt || '')
-        // Default to first 2 speakers (or fewer if not available)
-        const defaults = (cfg.supported_speakers || []).slice(0, 2)
-        setSelectedSpeakers(defaults)
+        setSelectedSpeakers(pickDefaultSpeakers(cfg.supported_speakers || []))
       } catch (e) {
         // Non-fatal; user can still use the app with defaults.
       }
@@ -155,8 +166,7 @@ export default function App() {
     setUseWebSearch(true)
     setTheme('')
     setMinutes(4)
-    const defaults = (supportedSpeakers || []).slice(0, 2)
-    if (defaults.length) setSelectedSpeakers(defaults)
+    setSelectedSpeakers(pickDefaultSpeakers(supportedSpeakers || []))
     setErr('')
     setMsg('New draft.')
   }
@@ -442,7 +452,7 @@ export default function App() {
 
   return (
     <div className="container">
-      <h1>Podcast Studio</h1>
+      <h1>VibeVoice Podcast Studio</h1>
       <div className="appShell">
         <div className="sidebar">
           <div className="card" style={{ marginTop: 0 }}>
