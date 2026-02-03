@@ -232,6 +232,7 @@ def generate_podcast_script(
     minutes: int = 4,
     speaker_count: int = 2,
     system_prompt: str | None = None,
+    language: str | None = None,
     source_text: str | None = None,
     use_web_search: bool = False,
     log: "ScriptLogWriter | None" = None,
@@ -294,12 +295,19 @@ def generate_podcast_script(
     else:
         if log is not None:
             log.step("generation", "Web search disabled")
+    lang = (language or "en").strip().lower()
+    if lang in {"zh", "cn", "chinese"}:
+        language_rule = "- 全部输出为中文（简体）。\n"
+    else:
+        language_rule = "- Output must be in English.\n"
+
     user = (
         f"主题：{theme}\n\n"
-        f"请生成一段约 {minutes} 分钟的 {speaker_count} 人播客对话脚本, 按指定的语言，默认英文。\n"
+        f"请生成一段约 {minutes} 分钟的 {speaker_count} 人播客对话脚本。\n"
         "严格使用以下格式逐行输出（只能使用 Speaker + 数字，不要写人名）：\n"
         f"{speaker_format}\n"
         "要求：\n"
+        f"{language_rule}"
         "- 主持人轮流对话，语气自然，有少量幽默\n"
         f"- 只允许出现 Speaker 1 到 Speaker {speaker_count}，不要输出其他名字或编号\n"
         "- 每行一句或两句，避免超长段落\n"

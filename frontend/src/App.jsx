@@ -22,6 +22,7 @@ export default function App() {
   const [supportedSpeakers, setSupportedSpeakers] = useState([])
   const [selectedSpeakers, setSelectedSpeakers] = useState(['Xinran', 'Anchen'])
   const [maxSpeakers, setMaxSpeakers] = useState(4)
+  const [ttsLanguage, setTtsLanguage] = useState('en')
   const [systemPrompt, setSystemPrompt] = useState('')
   const [builtinSystemPrompt, setBuiltinSystemPrompt] = useState('')
 
@@ -55,7 +56,7 @@ export default function App() {
     return !!theme.trim() || !!sourceText.trim()
   }, [theme, sourceText])
 
-  const jobStatus = job?.worker_status || null
+  const jobStatus = job?.worker_status || job?.status || null
   const shouldPollLogs = useMemo(() => {
     if (!scriptId) return false
     const jobActive = !!jobId && (!jobStatus || (jobStatus !== 'completed' && jobStatus !== 'failed'))
@@ -83,6 +84,11 @@ export default function App() {
       const v = c === 'x' ? r : (r & 0x3) | 0x8
       return v.toString(16)
     })
+  }
+
+  function guessTtsLanguage(text) {
+    // Heuristic: if any CJK character appears, assume Chinese.
+    return /[\u4E00-\u9FFF]/.test(String(text || '')) ? 'zh' : 'en'
   }
 
   useEffect(() => {
@@ -167,6 +173,7 @@ export default function App() {
     setTheme('')
     setMinutes(4)
     setSelectedSpeakers(pickDefaultSpeakers(supportedSpeakers || []))
+    setTtsLanguage(guessTtsLanguage(''))
     setErr('')
     setMsg('New draft.')
   }
@@ -185,6 +192,7 @@ export default function App() {
       setScriptId(s.script_id)
       setTheme(s.theme || '')
       setScript(s.content || '')
+      setTtsLanguage(guessTtsLanguage(s.content || ''))
       setConfirmed(!!s.confirmed)
 
       const meta = full.meta || null
@@ -280,6 +288,7 @@ export default function App() {
         speaker_names: selectedSpeakers,
         system_prompt: systemPrompt,
         source_filename: sourceFilename || undefined,
+        language: ttsLanguage,
         source_text: sourceText || undefined,
         source_url: sourceUrl || undefined,
         use_web_search: useWebSearch,
@@ -390,7 +399,7 @@ export default function App() {
     setErr('')
     setMsg('Submitting TTS job...')
     try {
-      const r = await submitTts(scriptId, { speaker_names: selectedSpeakers })
+      const r = await submitTts(scriptId, { speaker_names: selectedSpeakers, language: ttsLanguage })
       setJobId(r.job_id)
       setMsg('Job submitted. Waiting for completion...')
 
@@ -418,6 +427,8 @@ export default function App() {
         const j = await getJob(jobId)
         if (!alive) return
         setJob(j)
+
+        if (j.language) setTtsLanguage(j.language)
 
         if (j.worker_status) {
           setTtsJobs((prev) =>
@@ -610,6 +621,32 @@ export default function App() {
                 )
               })}
             </div>
+
+            <div style={{ marginTop: 10 }}>
+              <label>Language</label>
+              <div className="row" style={{ gap: 14, flexWrap: 'wrap', justifyContent: 'flex-start', marginTop: 6 }}>
+                <label className="small" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <input
+                    type="radio"
+                    name="ttsLanguage"
+                    value="en"
+                    checked={ttsLanguage === 'en'}
+                    onChange={() => setTtsLanguage('en')}
+                  />
+                  English
+                </label>
+                <label className="small" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <input
+                    type="radio"
+                    name="ttsLanguage"
+                    value="zh"
+                    checked={ttsLanguage === 'zh'}
+                    onChange={() => setTtsLanguage('zh')}
+                  />
+                  Chinese
+                </label>
+              </div>
+            </div>
           </div>
 
           <div style={{ flex: 2, minWidth: 320 }}>
@@ -653,7 +690,7 @@ export default function App() {
       <div className="card">
         <div className="row" style={{ justifyContent: 'space-between' }}>
           <div className="small">Job ID: {jobId || '-'}</div>
-          <div className="small">Worker status: {job?.worker_status || '-'}</div>
+          <div className="small">Status: {job?.worker_status || job?.status || '-'}</div>
         </div>
 
         {ttsJobs.length > 0 && (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,6 +97,7 @@ class GenerateScriptRequest(BaseModel):
     minutes: int = Field(default=4, ge=1, le=20)
     speaker_names: list[str] | None = Field(default=None, description="Selected speakers (1-4)")
     system_prompt: str | None = Field(default=None, max_length=4000)
+    language: str | None = Field(default=None, description="Script language: 'en' or 'zh'")
     source_filename: str | None = Field(default=None, max_length=200)
     source_text: str | None = Field(default=None, max_length=20000)
     source_url: str | None = Field(default=None, max_length=2000)
@@ -134,6 +136,7 @@ class ScriptMetaResponse(BaseModel):
     minutes: int
     speaker_names: list[str]
     system_prompt: str | None = None
+    language: str | None = None
     use_web_search: bool
     source_filename: str | None = None
     source_url: str | None = None
@@ -144,6 +147,7 @@ class ScriptJobItem(BaseModel):
     worker_job_id: str
     status: str
     worker_status: str | None = None
+    language: str | None = None
     output_filename: str | None = None
     error: str | None = None
     created_at: str
@@ -175,10 +179,12 @@ class SubmitTTSResponse(BaseModel):
     job_id: str
     worker_job_id: str
     status: str
+    language: str | None = None
 
 
 class SubmitTTSRequest(BaseModel):
     speaker_names: list[str] | None = Field(default=None, description="Selected speakers (1-4)")
+    language: str | None = Field(default=None, description="Script language: 'en' or 'zh'")
 
 
 class AppConfigResponse(BaseModel):
@@ -198,12 +204,29 @@ class JobStatus(BaseModel):
     worker_job_id: str
     status: str
     worker_status: str | None = None
+    language: str | None = None
     output_filename: str | None = None
     error: str | None = None
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _guess_language(text: str) -> str:
+    # Heuristic: presence of CJK Unified Ideographs implies Chinese.
+    return "zh" if re.search(r"[\u4E00-\u9FFF]", text or "") else "en"
+
+
+def _normalize_language(value: str | None, *, fallback_text: str) -> str:
+    if value is None:
+        return _guess_language(fallback_text)
+    v = str(value).strip().lower()
+    if v in {"en", "english"}:
+        return "en"
+    if v in {"zh", "cn", "chinese"}:
+        return "zh"
+    return _guess_language(fallback_text)
 
 
 def _coerce_speaker_list(value) -> list[str]:
@@ -324,6 +347,8 @@ def generate_script(req: GenerateScriptRequest):
     source_filename = (req.source_filename or "").strip() or None
     source_url = (req.source_url or "").strip() or None
 
+    language = _normalize_language(req.language, fallback_text=(source_text or theme))
+
     selected = [s.strip() for s in (req.speaker_names or []) if s and s.strip()]
     if selected and len(selected) > 4:
         raise HTTPException(status_code=400, detail="speaker_names max is 4")
@@ -402,6 +427,7 @@ def generate_script(req: GenerateScriptRequest):
             minutes=req.minutes,
             speaker_count=speaker_count,
             system_prompt=req.system_prompt,
+            language=language,
             source_text=source_text or None,
             use_web_search=req.use_web_search,
             log=log,
@@ -430,6 +456,7 @@ def generate_script(req: GenerateScriptRequest):
             "minutes": int(req.minutes),
             "speaker_names": selected,
             "system_prompt": (req.system_prompt if req.system_prompt is not None else None),
+            "language": language,
             "use_web_search": bool(req.use_web_search),
             "source_filename": (source_filename if source_filename else None),
             "source_url": (source_url if source_url else None),
@@ -522,12 +549,26 @@ def get_script_full(script_id: str):
                     continue
                 try:
                     r = client.get(f"{TTS_WORKER_URL}/jobs/{worker_job_id}")
+                    if r.status_code == 404:
+                        # Worker doesn't know this job (e.g., worker storage changed/restarted).
+                        if j.get("status") != "failed":
+                            j["status"] = "failed"
+                            j["error"] = "worker job not found"
+                            j["updated_at"] = _utc_now()
+                            STORE.put_job(j)
+                            changed = True
+                        continue
+
                     r.raise_for_status()
                     payload = r.json() or {}
                     worker_payload_by_job_id[str(j.get("job_id"))] = payload
                     ws = payload.get("status")
                     if ws in {"queued", "running", "completed", "failed"} and ws != j.get("status"):
                         j["status"] = ws
+                        if ws == "failed":
+                            j["error"] = payload.get("error")
+                        else:
+                            j["error"] = None
                         j["updated_at"] = _utc_now()
                         STORE.put_job(j)
                         changed = True
@@ -543,6 +584,7 @@ def get_script_full(script_id: str):
             minutes=int(meta.get("minutes") or 4),
             speaker_names=_coerce_speaker_list(meta.get("speaker_names")),
             system_prompt=(meta.get("system_prompt") if meta.get("system_prompt") is not None else None),
+            language=(meta.get("language") if meta.get("language") is not None else None),
             use_web_search=bool(meta.get("use_web_search")),
             source_filename=(meta.get("source_filename") if meta.get("source_filename") is not None else None),
             source_url=(meta.get("source_url") if meta.get("source_url") is not None else None),
@@ -563,8 +605,12 @@ def get_script_full(script_id: str):
                 worker_job_id=str(j.get("worker_job_id") or ""),
                 status=str(j.get("status") or "queued"),
                 worker_status=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("status"),
+                language=(j.get("language") if j.get("language") is not None else None),
                 output_filename=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("output_filename"),
-                error=(worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("error"),
+                error=(
+                    (worker_payload_by_job_id.get(str(j.get("job_id")), {}) or {}).get("error")
+                    or (j.get("error") if j.get("error") is not None else None)
+                ),
                 created_at=str(j.get("created_at") or ""),
                 updated_at=str(j.get("updated_at") or ""),
             )
@@ -630,6 +676,7 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
     if not bool(row.get("confirmed")):
         raise HTTPException(status_code=400, detail="script must be confirmed before TTS")
     content = str(row.get("content") or "")
+    language = _normalize_language((req.language if req else None), fallback_text=content)
 
     job_id = str(uuid.uuid4())
 
@@ -650,6 +697,7 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
                     "script_id": script_id,
                     "script_text": content,
                     "speaker_names": (req.speaker_names if req else None),
+                    "language": language,
                 },
             )
             r.raise_for_status()
@@ -680,6 +728,7 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
             "script_id": script_id,
             "worker_job_id": worker_job_id,
             "status": status,
+            "language": language,
             "created_at": now,
             "updated_at": now,
         }
@@ -690,6 +739,7 @@ def submit_tts(script_id: str, req: SubmitTTSRequest | None = None):
         job_id=job_id,
         worker_job_id=worker_job_id,
         status=status,
+        language=language,
     )
 
 
@@ -706,6 +756,27 @@ def get_job(job_id: str):
         timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             r = client.get(f"{TTS_WORKER_URL}/jobs/{str(row.get('worker_job_id') or '')}")
+            if r.status_code == 404:
+                # Worker doesn't know this job (e.g., worker storage changed/restarted).
+                worker_status = None
+                output_filename = None
+                error = "worker job not found"
+                if row.get("status") != "failed" or row.get("error") != error:
+                    row["status"] = "failed"
+                    row["error"] = error
+                    row["updated_at"] = _utc_now()
+                    STORE.put_job(row)
+                return JobStatus(
+                    job_id=str(row.get("job_id")),
+                    script_id=str(row.get("script_id")),
+                    worker_job_id=str(row.get("worker_job_id")),
+                    status=str(row.get("status") or "failed"),
+                    worker_status=None,
+                    language=(row.get("language") if row.get("language") is not None else None),
+                    output_filename=None,
+                    error=error,
+                )
+
             r.raise_for_status()
             payload = r.json()
             worker_status = payload.get("status")
@@ -717,6 +788,10 @@ def get_job(job_id: str):
     # Best-effort local status sync.
     if worker_status in {"queued", "running", "completed", "failed"} and worker_status != row.get("status"):
         row["status"] = worker_status
+        if worker_status == "failed":
+            row["error"] = error
+        else:
+            row["error"] = None
         row["updated_at"] = _utc_now()
         STORE.put_job(row)
 
@@ -726,8 +801,9 @@ def get_job(job_id: str):
         worker_job_id=str(row.get("worker_job_id")),
         status=(worker_status or row["status"]),
         worker_status=worker_status,
+        language=(row.get("language") if row.get("language") is not None else None),
         output_filename=output_filename,
-        error=error,
+        error=(error or (row.get("error") if row.get("error") is not None else None)),
     )
 
 

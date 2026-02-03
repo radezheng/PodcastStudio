@@ -26,10 +26,10 @@ async function req(path, options = {}) {
   return r
 }
 
-export async function generateScript({ theme, minutes }) {
+export async function generateScript({ theme, minutes, language } = {}) {
   const r = await req('/api/scripts/generate', {
     method: 'POST',
-    body: JSON.stringify({ theme, minutes }),
+    body: JSON.stringify({ theme, minutes, language }),
   })
   return await r.json()
 }
@@ -56,10 +56,10 @@ export async function saveSystemPrompt(system_prompt) {
   return await r.json()
 }
 
-export async function generateScriptV2({ theme, minutes, speaker_names, system_prompt }) {
+export async function generateScriptV2({ theme, minutes, speaker_names, system_prompt, language } = {}) {
   const r = await req('/api/scripts/generate', {
     method: 'POST',
-    body: JSON.stringify({ theme, minutes, speaker_names, system_prompt }),
+    body: JSON.stringify({ theme, minutes, speaker_names, system_prompt, language }),
   })
   return await r.json()
 }
@@ -70,6 +70,7 @@ export async function generateScriptV3({
   minutes,
   speaker_names,
   system_prompt,
+  language,
   source_filename,
   source_text,
   source_url,
@@ -83,6 +84,7 @@ export async function generateScriptV3({
       minutes,
       speaker_names,
       system_prompt,
+      language,
       source_filename,
       source_text,
       source_url,
@@ -134,10 +136,10 @@ export async function confirmScript(scriptId) {
   return await r.json()
 }
 
-export async function submitTts(scriptId, { speaker_names } = {}) {
+export async function submitTts(scriptId, { speaker_names, language } = {}) {
   const r = await req(`/api/scripts/${scriptId}/tts`, {
     method: 'POST',
-    body: JSON.stringify({ speaker_names }),
+    body: JSON.stringify({ speaker_names, language }),
   })
   return await r.json()
 }

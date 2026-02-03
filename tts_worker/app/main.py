@@ -62,10 +62,38 @@ STORE = WorkerFileStore(root=DB_DIR)
 app = FastAPI(title="VibeVoice TTS Worker", version="0.1.0")
 
 
+def _reap_orphaned_jobs_on_startup() -> None:
+    """Mark persisted 'running' jobs as failed after restart.
+
+    The worker persists job state to disk, but does not persist the full
+    processing payload (script_text, etc.). If the worker restarts mid-job,
+    those jobs cannot be resumed and would otherwise stay 'running' forever.
+    """
+
+    try:
+        jobs = STORE.list_jobs()
+    except Exception:
+        jobs = []
+
+    now = _utc_now()
+    for job in jobs:
+        try:
+            status = str(job.get("status") or "").strip().lower()
+            if status != "running":
+                continue
+            job["status"] = "failed"
+            job["error"] = "worker restarted; job orphaned"
+            job["updated_at"] = now
+            STORE.put_job(job)
+        except Exception:
+            continue
+
+
 @app.on_event("startup")
 def _startup_warmup() -> None:
     # Start model download/loading early without blocking worker startup.
     start_background_warmup()
+    _reap_orphaned_jobs_on_startup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,6 +117,7 @@ def _process_job(
     script_id: str | None,
     script_text: str,
     speaker_names: list[str] | None,
+    language: str | None,
 ) -> None:
     job = STORE.get_job(job_id) or {}
     job.update({"status": "running", "updated_at": _utc_now()})
@@ -134,6 +163,7 @@ class SubmitJobRequest(BaseModel):
     script_id: str | None = None
     script_text: str = Field(..., min_length=1)
     speaker_names: list[str] | None = None
+    language: str | None = None
 
 
 class SubmitJobResponse(BaseModel):
@@ -145,6 +175,7 @@ class JobResponse(BaseModel):
     job_id: str
     script_id: str | None = None
     status: str
+    language: str | None = None
     output_filename: str | None = None
     error: str | None = None
 
@@ -162,6 +193,7 @@ def submit_job(req: SubmitJobRequest):
         "job_id": job_id,
         "script_id": req.script_id,
         "status": "queued",
+        "language": (req.language if req.language is not None else None),
         "output_path": None,
         "error": None,
         "created_at": _utc_now(),
@@ -175,6 +207,7 @@ def submit_job(req: SubmitJobRequest):
         script_id=req.script_id,
         script_text=req.script_text,
         speaker_names=req.speaker_names,
+        language=req.language,
     )
 
     return SubmitJobResponse(job_id=job_id, status="queued")
@@ -194,6 +227,7 @@ def get_job(job_id: str):
         job_id=str(row.get("job_id")),
         script_id=(row.get("script_id") if row.get("script_id") is not None else None),
         status=str(row.get("status") or "queued"),
+        language=(row.get("language") if row.get("language") is not None else None),
         output_filename=output_filename,
         error=(row.get("error") if row.get("error") is not None else None),
     )
